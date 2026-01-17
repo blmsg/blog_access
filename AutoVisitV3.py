@@ -28,7 +28,7 @@ def load_proxies_from_file(path="proxies.txt"):
 def get_valid_proxy(max_attempts=25):
     proxies = load_proxies_from_file()
     if not proxies:
-        logger.warning("⚠️ 代理列表为空，将尝试本地直连")
+        logger.warning("⚠️ 代理列表为空，将尝试本地直连.\n")
         return None
 
     random.shuffle(proxies)
@@ -240,3 +240,4 @@ if __name__ == "__main__":
         run_playwright()
     except Exception as e:
         logger.error(f"执行过程中发生错误: {e}")
+
