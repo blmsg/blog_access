@@ -1,55 +1,71 @@
 import datetime
-import time
-import random
+import logging
 import os
+import random
+import time
+from urllib.parse import quote, urljoin, urlparse
+
 import requests
-from playwright.sync_api import sync_playwright
-from logger import setup_logger
 from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 
 # 加载环境变量
 load_dotenv()
-logger = setup_logger()
+logger = logging.getLogger(__name__)
 
 # Telegram 配置
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
-HOMEPAGE_URL = os.getenv('HOMEPAGE_URL', 'https://blog.883881.xyz')
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+HOMEPAGE_URL = os.getenv("HOMEPAGE_URL", "https://blog.883881.xyz")
 
 # === 代理相关 ===
 def load_proxies_from_file(path="proxies.txt"):
     if not os.path.exists(path):
         logger.warning(f"⚠️ 未找到代理列表文件：{path}，将尝试本地直连")
         return []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip() and "|" in line]
         return lines
 
 def get_valid_proxy(max_attempts=25):
     proxies = load_proxies_from_file()
     if not proxies:
-        logger.warning("⚠️ 代理列表为空，将尝试本地直连.\n")
+        logger.warning("⚠️ 代理列表为空，将尝试本地直连")
         return None
 
     random.shuffle(proxies)
     for attempt, line in enumerate(proxies[:max_attempts], start=1):
         try:
-            left, right = line.split("|")
-            ip, port, proto = left.strip().split(":")
-            user, pwd = right.strip().split(":")
+            left, separator, right = line.partition("|")
+            if not separator:
+                raise ValueError("代理格式缺少 | 分隔符")
 
-            proxy_url = f"{proto}://{user}:{pwd}@{ip}:{port}"
-            logger.info(f"🔌 正在测试代理：{proxy_url}")
+            ip, port, proto = left.strip().rsplit(":", 2)
+            user, separator, pwd = right.strip().partition(":")
+            if not separator:
+                raise ValueError("代理认证信息缺少 : 分隔符")
+            if not ip or not port.isdigit() or not proto or not user:
+                raise ValueError("代理地址或认证信息不完整")
+
+            proxy_url = (
+                f"{proto}://{quote(user, safe='')}:{quote(pwd, safe='')}"
+                f"@{ip}:{port}"
+            )
+            logger.info("🔌 正在测试代理：%s://%s:%s", proto, ip, port)
             response = requests.get(
                 "https://www.google.com",
                 proxies={"http": proxy_url, "https": proxy_url},
-                timeout=5
+                timeout=5,
             )
             if response.status_code == 200:
-                logger.info(f"✅ 验证通过，使用代理：{proxy_url}")
+                logger.info("✅ 验证通过，使用代理：%s://%s:%s", proto, ip, port)
                 return proxy_url
-        except Exception as e:
-            logger.warning(f"⚠️ 第 {attempt} 个代理不可用：{line}")
+        except (ValueError, requests.RequestException) as error:
+            logger.warning(
+                "⚠️ 第 %s 个代理不可用，跳过（%s）",
+                attempt,
+                type(error).__name__,
+            )
     logger.warning("⚠️ 没有可用的代理，将尝试本地直连")
     return None
 
@@ -66,10 +82,13 @@ visit_data = {
 }
 
 def generate_unique_cookie():
+    cookie_domain = urlparse(HOMEPAGE_URL).hostname
+    if not cookie_domain:
+        raise ValueError(f"HOMEPAGE_URL 不是有效网址：{HOMEPAGE_URL}")
     cookie = {
         "name": "_ga",
         "value": f"GA1.2.{random.randint(1000000000, 9999999999)}.{int(time.time())}",
-        "domain": "blog.883881.xyz",
+        "domain": cookie_domain,
         "path": "/",
         "expires": int(time.time()) + 365 * 24 * 60 * 60
     }
@@ -77,8 +96,12 @@ def generate_unique_cookie():
     return cookie
 
 def send_telegram_message(title, date):
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.warning("⚠️ 未配置 BOT_TOKEN 或 CHAT_ID，跳过 Telegram 通知")
+        return False
+
     message = f"""
-*📅 标题：* 博客访问情况统计
+*📅 标题：* {title}
 *📅 日期：* {date}
 
 *📈 访问页面情况：*
@@ -92,11 +115,15 @@ def send_telegram_message(title, date):
 """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     params = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
-        logger.info("✅ Telegram 消息发送成功")
-    else:
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            logger.info("✅ Telegram 消息发送成功")
+            return True
         logger.error(f"❌ 消息发送失败，状态码: {response.status_code}")
+    except requests.RequestException as error:
+        logger.error("❌ Telegram 请求失败：%s", type(error).__name__)
+    return False
 
 def scroll_page(page, scroll_delay=1, times=3):
     for _ in range(times):
@@ -106,48 +133,57 @@ def scroll_page(page, scroll_delay=1, times=3):
         page.mouse.wheel(0, -random.randint(123, 589))
         time.sleep(random.uniform(scroll_delay - 0.5, scroll_delay + 0.5))
 
-def click_random_article(page):
-    article_links = page.query_selector_all('a.article-title')
+def select_random_article_url(page):
+    article_links = page.query_selector_all("a.article-title")
     if not article_links:
-        logger.info("未找到文章链接，跳过点击操作")
+        logger.info("未找到文章链接，跳过文章访问")
         return None
+
     articles_with_dates = []
     for article in article_links:
-        article_url = article.get_attribute('href')
-        if not article_url:
+        raw_url = article.get_attribute("href")
+        if not raw_url:
             continue
-        try:
-            date_str = "/".join(article_url.split('/')[1:4])
-            article_date = datetime.datetime.strptime(date_str, "%Y/%m/%d")
-            articles_with_dates.append((article, article_date))
-        except ValueError:
-            continue
-    sorted_articles = sorted(articles_with_dates, key=lambda x: x[1], reverse=True)
+
+        article_url = urljoin(HOMEPAGE_URL, raw_url)
+        path_parts = [part for part in urlparse(article_url).path.split("/") if part]
+        article_date = None
+        for index in range(len(path_parts) - 2):
+            try:
+                article_date = datetime.datetime.strptime(
+                    "/".join(path_parts[index:index + 3]), "%Y/%m/%d"
+                )
+                break
+            except ValueError:
+                continue
+        if article_date is not None:
+            articles_with_dates.append((article_url, article_date))
+
+    sorted_articles = sorted(articles_with_dates, key=lambda item: item[1], reverse=True)
     if not sorted_articles:
+        logger.info("未找到包含有效日期的文章链接")
         return None
-    random_article = random.choice(sorted_articles[:10])[0]
-    article_url = random_article.get_attribute('href')
-    if article_url:
-        logger.info(f"随机点击文章：{article_url}")
-        page.wait_for_selector(f'a.article-title[href="{article_url}"]', timeout=10000)
-        page.click(f'a.article-title[href="{HOMEPAGE_URL}{article_url}"]')
-        time.sleep(random.uniform(2, 4))
-        scroll_page(page)
-        return article_url
-    return None
+
+    article_url, _ = random.choice(sorted_articles[:10])
+    logger.info("随机选择文章：%s", article_url)
+    return article_url
 
 def visit_article_and_return_home(page, article_url):
+    visit_data["total_visits"] += 1
     try:
         page.goto(article_url, timeout=30000)
         page.wait_for_load_state("networkidle")
         scroll_page(page)
         time.sleep(random.uniform(10, 15))
-        page.goto(HOMEPAGE_URL)
+        page.goto(HOMEPAGE_URL, timeout=30000)
         page.wait_for_load_state("networkidle")
         visit_data["article_visits"] += 1
-    except Exception as e:
-        logger.error(f"访问文章时发生错误：{e}")
+        visit_data["successful_visits"] += 1
+        return True
+    except Exception as error:
+        logger.error("访问文章时发生错误：%s", error)
         visit_data["failed_visits"] += 1
+        return False
 
 def run_playwright():
     proxy = get_valid_proxy()
@@ -183,7 +219,7 @@ def run_playwright():
         }
         if proxy:
             launch_args["proxy"] = {"server": proxy}
-            logger.info(f"🌍 使用代理访问：{launch_args}")
+            logger.info("🌍 使用代理访问")
         else:
             logger.info("🌐 未使用代理，采用本地直连方式")
 
@@ -214,17 +250,15 @@ def run_playwright():
             "failed_visits": 0, "successful_visits": 0
         })
         for _ in range(2):
+            visit_data["total_visits"] += 1
             try:
                 page.goto(HOMEPAGE_URL, timeout=30000)
                 page.wait_for_load_state("networkidle")
                 scroll_page(page)
                 visit_data["homepage_visits"] += 1
-                visit_data["total_visits"] += 1
-                article_url = click_random_article(page)
+                article_url = select_random_article_url(page)
                 if article_url:
                     visit_article_and_return_home(page, article_url)
-                    visit_data["successful_visits"] += 1
-                    visit_data["total_visits"] += 1
             except Exception as e:
                 logger.error(f"执行过程中发生错误: {e}")
                 visit_data["failed_visits"] += 1
@@ -236,6 +270,10 @@ def run_playwright():
             visit_data["last_update"] = time.time()
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     try:
         run_playwright()
     except Exception as e:
